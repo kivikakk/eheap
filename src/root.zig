@@ -221,7 +221,8 @@ fn expectHeap(heap: anytype, comptime layout: anytype) !void {
 }
 
 test "alloc and free" {
-    var heap = Heap(64 * 1024){};
+    const arena: [64 * 1024]u8 align(4) = undefined;
+    var heap = Heap(64 * 1024){ .arena = arena };
     heap.initialize();
     const allocator = heap.allocator();
 
@@ -244,7 +245,8 @@ test "alloc and free" {
 }
 
 test "alloc and free and ..." {
-    var heap = Heap(64 * 1024){};
+    const arena: [64 * 1024]u8 align(4) = undefined;
+    var heap = Heap(64 * 1024){ .arena = arena };
     heap.initialize();
     const allocator = heap.allocator();
 
