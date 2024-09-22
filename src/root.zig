@@ -4,19 +4,15 @@ const testing = std.testing;
 
 pub fn Heap(comptime HeapSize: usize) type {
     return struct {
-        const Self = @This();
+        var arena: [HeapSize]u8 align(4) = undefined;
+        var initialized: bool = false;
 
-        arena: [HeapSize]u8 align(4) = undefined,
-        initialized: bool = false,
+        var arena_free: usize = HeapSize - AllocationHeaderSize;
 
-        arena_free: usize = HeapSize - AllocationHeaderSize,
-
-        pub fn allocator(self: *Self) Allocator {
-            return .{
-                .ptr = self,
-                .vtable = &allocator_vtable,
-            };
-        }
+        pub const allocator: Allocator = .{
+            .ptr = undefined,
+            .vtable = &allocator_vtable,
+        };
 
         const allocator_vtable = Allocator.VTable{
             .alloc = alloc,
@@ -43,40 +39,38 @@ pub fn Heap(comptime HeapSize: usize) type {
                 return @ptrFromInt(p);
             }
 
-            fn next(self: *align(1) const AllocationHeader, heap: *Self) ?*align(1) AllocationHeader {
-                var ix: usize = @intFromPtr(self) - @intFromPtr(heap.arena[0..]);
+            fn next(self: *align(1) const AllocationHeader) ?*align(1) AllocationHeader {
+                var ix: usize = @intFromPtr(self) - @intFromPtr(arena[0..]);
                 ix += self.size + AllocationHeaderSize;
                 if (ix >= HeapSize - AllocationHeaderSize) {
                     return null;
                 }
-                return @ptrCast(heap.arena[ix..]);
+                return @ptrCast(arena[ix..]);
             }
         };
 
         const AllocationHeaderSize = 3;
 
-        pub fn initialize(self: *Self) void {
-            const ptr: *align(1) AllocationHeader = @ptrCast(self.arena[0..]);
+        pub fn initialize() void {
+            const ptr: *align(1) AllocationHeader = @ptrCast(arena[0..]);
             ptr.* = .{
                 .size = HeapSize - AllocationHeaderSize,
                 .log2_align = 0,
                 .occupied = false,
             };
-            self.initialized = true;
+            initialized = true;
         }
 
         fn alloc(
-            heap_ptr: *anyopaque,
+            _: *anyopaque,
             len: usize,
             log2_ptr_align: u8,
             ret_addr: usize,
         ) ?[*]u8 {
             _ = ret_addr;
 
-            var heap: *Self = @ptrCast(@alignCast(heap_ptr));
-
-            if (!heap.initialized)
-                heap.initialize();
+            if (!initialized)
+                initialize();
 
             const MASK: u3 = switch (log2_ptr_align) {
                 0 => 0b000,
@@ -86,11 +80,11 @@ pub fn Heap(comptime HeapSize: usize) type {
                 else => std.debug.panic("heap alloc align log2_ptr {d}", .{log2_ptr_align}),
             };
 
-            var ptr: *align(1) AllocationHeader = @ptrCast(heap.arena[0..]);
+            var ptr: *align(1) AllocationHeader = @ptrCast(arena[0..]);
 
             var result: [*]u8 = undefined;
             var needed: usize = undefined;
-            while (true) : (ptr = ptr.next(heap) orelse return null) {
+            while (true) : (ptr = ptr.next() orelse return null) {
                 if (!ptr.occupied) {
                     var p = @intFromPtr(ptr.bufPtr());
                     needed = len;
@@ -111,16 +105,16 @@ pub fn Heap(comptime HeapSize: usize) type {
                 const old_size = ptr.size;
                 ptr.size = @intCast(needed);
 
-                heap.arena_free -= ptr.size + AllocationHeaderSize;
+                arena_free -= ptr.size + AllocationHeaderSize;
 
-                const nextPtr = ptr.next(heap).?;
+                const nextPtr = ptr.next().?;
                 nextPtr.* = .{
                     .size = @intCast(old_size - ptr.size - AllocationHeaderSize),
                     .log2_align = 0,
                     .occupied = false,
                 };
             } else {
-                heap.arena_free -= ptr.size;
+                arena_free -= ptr.size;
             }
 
             return result;
@@ -143,20 +137,21 @@ pub fn Heap(comptime HeapSize: usize) type {
         }
 
         fn free(
-            heap_ptr: *anyopaque,
+            _: *anyopaque,
             buf: []u8,
             log2_old_align: u8,
             ret_addr: usize,
         ) void {
             _ = ret_addr;
 
-            var heap: *Self = @ptrCast(@alignCast(heap_ptr));
+            if (!initialized)
+                initialize();
 
             // XXX: this is very slow. If we don't want to do this, we need to change
             // how we handle aligned allocations entirely, since right now any induced
             // alignment causes the header to not be at (&buf-3).
-            var ptr: *align(1) AllocationHeader = @ptrCast(heap.arena[0..]);
-            while (true) : (ptr = ptr.next(heap) orelse @panic("invalid free")) {
+            var ptr: *align(1) AllocationHeader = @ptrCast(arena[0..]);
+            while (true) : (ptr = ptr.next() orelse @panic("invalid free")) {
                 if (@as([*]u8, @ptrCast(buf)) == ptr.bufPtr()) {
                     break;
                 }
@@ -167,12 +162,12 @@ pub fn Heap(comptime HeapSize: usize) type {
             ptr.occupied = false;
             ptr.log2_align = 0;
 
-            heap.arena_free += ptr.size;
+            arena_free += ptr.size;
 
-            ptr = @ptrCast(heap.arena[0..]);
-            while (ptr.next(heap)) |nextPtr| {
+            ptr = @ptrCast(arena[0..]);
+            while (ptr.next()) |nextPtr| {
                 if (!ptr.occupied and !nextPtr.occupied) {
-                    heap.arena_free += AllocationHeaderSize;
+                    arena_free += AllocationHeaderSize;
                     ptr.size += AllocationHeaderSize + nextPtr.size;
                 } else {
                     ptr = nextPtr;
@@ -193,7 +188,7 @@ fn expectHeap(heap: anytype, comptime layout: anytype) !void {
         free: ?usize = null,
     };
 
-    var eptr: ?*align(1) @TypeOf(heap.*).AllocationHeader = @ptrCast(heap.arena[0..]);
+    var eptr: ?*align(1) heap.AllocationHeader = @ptrCast(heap.arena[0..]);
     inline for (layout) |o| {
         const ptr = eptr.?;
         const e = @as(Expectation, o);
@@ -214,23 +209,21 @@ fn expectHeap(heap: anytype, comptime layout: anytype) !void {
             try testing.expectEqual(size, ptr.size);
         }
 
-        eptr = ptr.next(heap);
+        eptr = ptr.next();
     }
 
     try testing.expectEqual(null, eptr);
 }
 
 test "alloc and free" {
-    const arena: [64 * 1024]u8 align(4) = undefined;
-    var heap = Heap(64 * 1024){ .arena = arena };
+    const heap = Heap(64 * 1024);
     heap.initialize();
-    const allocator = heap.allocator();
 
     try expectHeap(&heap, .{
         .{ .free = 65533 },
     });
 
-    const s = try allocator.alloc(u8, 5);
+    const s = try heap.allocator.alloc(u8, 5);
     @memcpy(s, "tere!");
 
     try expectHeap(&heap, .{
@@ -238,26 +231,24 @@ test "alloc and free" {
         .{ .free = 65525 },
     });
 
-    allocator.free(s);
+    heap.allocator.free(s);
     try expectHeap(&heap, .{
         .{ .free = 65533 },
     });
 }
 
 test "alloc and free and ..." {
-    const arena: [64 * 1024]u8 align(4) = undefined;
-    var heap = Heap(64 * 1024){ .arena = arena };
+    const heap = Heap(64 * 1024);
     heap.initialize();
-    const allocator = heap.allocator();
 
     try expectHeap(&heap, .{
         .{ .free = 65533 },
     });
 
-    const s = try allocator.alloc(u8, 5);
+    const s = try heap.allocator.alloc(u8, 5);
     @memcpy(s, "tere!");
 
-    const t = try allocator.alloc(u8, 8);
+    const t = try heap.allocator.alloc(u8, 8);
     @memcpy(t, "tervist!");
 
     try expectHeap(&heap, .{
@@ -266,7 +257,7 @@ test "alloc and free and ..." {
         .{ .free = 65514 },
     });
 
-    allocator.free(s);
+    heap.allocator.free(s);
     try expectHeap(&heap, .{
         .{ .free = 5 },
         .{ .occupied = "tervist!" },
@@ -274,7 +265,7 @@ test "alloc and free and ..." {
     });
 
     {
-        const u = try allocator.alloc(u8, 2);
+        const u = try heap.allocator.alloc(u8, 2);
         @memcpy(u, ":)");
 
         try expectHeap(&heap, .{
@@ -283,11 +274,11 @@ test "alloc and free and ..." {
             .{ .free = 65514 },
         });
 
-        allocator.free(u);
+        heap.allocator.free(u);
     }
 
     {
-        const u = try allocator.alloc(u8, 3);
+        const u = try heap.allocator.alloc(u8, 3);
         @memcpy(u, ":))");
 
         try expectHeap(&heap, .{
@@ -296,11 +287,11 @@ test "alloc and free and ..." {
             .{ .free = 65514 },
         });
 
-        allocator.free(u);
+        heap.allocator.free(u);
     }
 
     {
-        const u = try allocator.alloc(u8, 4);
+        const u = try heap.allocator.alloc(u8, 4);
         @memcpy(u, ":)))");
 
         try expectHeap(&heap, .{
@@ -309,11 +300,11 @@ test "alloc and free and ..." {
             .{ .free = 65514 },
         });
 
-        allocator.free(u);
+        heap.allocator.free(u);
     }
 
     {
-        const u = try allocator.alloc(u8, 1);
+        const u = try heap.allocator.alloc(u8, 1);
         @memcpy(u, "!");
 
         try expectHeap(&heap, .{
@@ -323,10 +314,10 @@ test "alloc and free and ..." {
             .{ .free = 65514 },
         });
 
-        allocator.free(u);
+        heap.allocator.free(u);
     }
 
-    allocator.free(t);
+    heap.allocator.free(t);
 
     try expectHeap(&heap, .{
         .{ .free = 65533 },
@@ -334,16 +325,15 @@ test "alloc and free and ..." {
 }
 
 test "alloc aligned" {
-    var heap = Heap(64 * 1024){};
+    const heap = Heap(64 * 1024);
     heap.initialize();
-    const allocator = heap.allocator();
 
     try expectHeap(&heap, .{
         .{ .free = 65533 },
     });
 
     // Displace alignment for following allocation. (3+3+3=9)
-    const a = try allocator.alloc(u8, 3);
+    const a = try heap.allocator.alloc(u8, 3);
     @memcpy(a, "<!>");
 
     try expectHeap(&heap, .{
@@ -352,7 +342,7 @@ test "alloc aligned" {
     });
 
     std.debug.assert(@alignOf(u32) == 4);
-    const b: []u32 = @alignCast(try allocator.alloc(u32, 1));
+    const b: []u32 = @alignCast(try heap.allocator.alloc(u32, 1));
     b[0] = 0xaabbccdd;
 
     try expectHeap(&heap, .{
@@ -363,9 +353,7 @@ test "alloc aligned" {
 }
 
 test "alloc fuzz" {
-    var heap = Heap(64 * 1024){};
-    heap.initialize();
-    const allocator = heap.allocator();
+    const heap = Heap(64 * 1024);
 
     const Allo = union(enum) {
         one: []u8,
@@ -383,25 +371,25 @@ test "alloc fuzz" {
     for (0..1000) |_| {
         switch (random.enumValue(enum { one, two, four, eight, free })) {
             .one => {
-                const v = allocator.alloc(u8, random.uintLessThan(usize, 100)) catch continue;
+                const v = heap.allocator.alloc(u8, random.uintLessThan(usize, 100)) catch continue;
                 try allocations.append(.{ .one = v });
             },
             .two => {
-                const v = allocator.alloc(u16, random.uintLessThan(usize, 80)) catch continue;
+                const v = heap.allocator.alloc(u16, random.uintLessThan(usize, 80)) catch continue;
                 try allocations.append(.{ .two = v });
             },
             .four => {
-                const v = allocator.alloc(u32, random.uintLessThan(usize, 70)) catch continue;
+                const v = heap.allocator.alloc(u32, random.uintLessThan(usize, 70)) catch continue;
                 try allocations.append(.{ .four = v });
             },
             .eight => {
-                const v = allocator.alloc(u64, random.uintLessThan(usize, 200)) catch continue;
+                const v = heap.allocator.alloc(u64, random.uintLessThan(usize, 200)) catch continue;
                 try allocations.append(.{ .eight = v });
             },
             .free => if (allocations.items.len > 0) {
                 const ix = random.uintLessThan(usize, allocations.items.len);
                 switch (allocations.orderedRemove(ix)) {
-                    inline else => |p| allocator.free(p),
+                    inline else => |p| heap.allocator.free(p),
                 }
             },
         }
