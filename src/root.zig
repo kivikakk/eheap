@@ -7,7 +7,8 @@ pub fn Heap(comptime HeapSize: usize) type {
         var arena: [HeapSize]u8 align(4) = undefined;
         var initialized: bool = false;
 
-        var arena_free: usize = HeapSize - AllocationHeaderSize;
+        pub const ArenaSize = HeapSize;
+        pub var arena_free: usize = HeapSize - AllocationHeaderSize;
 
         pub const allocator: Allocator = .{
             .ptr = undefined,
@@ -20,7 +21,7 @@ pub fn Heap(comptime HeapSize: usize) type {
             .free = free,
         };
 
-        const AllocationHeader = packed struct(u24) {
+        pub const AllocationHeader = packed struct(u24) {
             size: u21,
             log2_align: u2,
             occupied: bool,
@@ -39,8 +40,8 @@ pub fn Heap(comptime HeapSize: usize) type {
                 return @ptrFromInt(p);
             }
 
-            fn next(self: *align(1) const AllocationHeader) ?*align(1) AllocationHeader {
-                var ix: usize = @intFromPtr(self) - @intFromPtr(arena[0..]);
+            pub fn next(self: *align(1) const AllocationHeader) ?*align(1) AllocationHeader {
+                var ix: usize = @intFromPtr(self) - @intFromPtr(start());
                 ix += self.size + AllocationHeaderSize;
                 if (ix >= HeapSize - AllocationHeaderSize) {
                     return null;
@@ -52,13 +53,17 @@ pub fn Heap(comptime HeapSize: usize) type {
         const AllocationHeaderSize = 3;
 
         pub fn initialize() void {
-            const ptr: *align(1) AllocationHeader = @ptrCast(arena[0..]);
+            const ptr: *align(1) AllocationHeader = start();
             ptr.* = .{
                 .size = HeapSize - AllocationHeaderSize,
                 .log2_align = 0,
                 .occupied = false,
             };
             initialized = true;
+        }
+
+        pub fn start() *align(1) AllocationHeader {
+            return @ptrCast(arena[0..]);
         }
 
         fn alloc(
@@ -80,7 +85,7 @@ pub fn Heap(comptime HeapSize: usize) type {
                 else => std.debug.panic("heap alloc align log2_ptr {d}", .{log2_ptr_align}),
             };
 
-            var ptr: *align(1) AllocationHeader = @ptrCast(arena[0..]);
+            var ptr: *align(1) AllocationHeader = start();
 
             var result: [*]u8 = undefined;
             var needed: usize = undefined;
@@ -150,7 +155,7 @@ pub fn Heap(comptime HeapSize: usize) type {
             // XXX: this is very slow. If we don't want to do this, we need to change
             // how we handle aligned allocations entirely, since right now any induced
             // alignment causes the header to not be at (&buf-3).
-            var ptr: *align(1) AllocationHeader = @ptrCast(arena[0..]);
+            var ptr: *align(1) AllocationHeader = start();
             while (true) : (ptr = ptr.next() orelse @panic("invalid free")) {
                 if (@as([*]u8, @ptrCast(buf)) == ptr.bufPtr()) {
                     break;
@@ -164,7 +169,7 @@ pub fn Heap(comptime HeapSize: usize) type {
 
             arena_free += ptr.size;
 
-            ptr = @ptrCast(arena[0..]);
+            ptr = start();
             while (ptr.next()) |nextPtr| {
                 if (!ptr.occupied and !nextPtr.occupied) {
                     arena_free += AllocationHeaderSize;
@@ -188,7 +193,7 @@ fn expectHeap(heap: anytype, comptime layout: anytype) !void {
         free: ?usize = null,
     };
 
-    var eptr: ?*align(1) heap.AllocationHeader = @ptrCast(heap.arena[0..]);
+    var eptr: ?*align(1) const heap.AllocationHeader = heap.start();
     inline for (layout) |o| {
         const ptr = eptr.?;
         const e = @as(Expectation, o);
